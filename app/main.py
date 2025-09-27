@@ -1,3 +1,32 @@
+from openai import OpenAI
+import base64, os
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+def classify_issue_from_photo(photo_bytes: bytes) -> str:
+    """Send photo to OpenAI Vision model and ask for classification."""
+    b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # vision-capable model
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a road maintenance inspector. Classify road problems in images."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Classify the road issue. Options: pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice. Respond with one word."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }
+            ],
+            max_tokens=50
+        )
+        return response.choices[0].message.content.strip().lower()
+    except Exception as e:
+        return "unknown"
 
 import os, io, re, sqlite3, uuid, pathlib, datetime
 from typing import Optional
@@ -136,13 +165,18 @@ async def chat(session_id: str = Form(...), text: Optional[str] = Form(None), ph
         path, bytes_data = save_photo(photo)
         s["photo_path"] = path
         lat, lon = parse_exif_gps(bytes_data)
-        s["lat"], s["lon"] = lat, lon
-        if lat is None or lon is None:
-            s["step"] = "ask_location"
-            return JSONResponse({"reply": "Thanks for the photo. I couldn’t read its GPS location. What road and nearest milepost or intersection is this?", "done": False})
-        else:
-            s["step"] = "classify_or_confirm"
-            return JSONResponse({"reply": "Photo received ✔️. I detected a location. What is the problem type? (pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice)", "done": False})
+s["lat"], s["lon"] = lat, lon
+
+# Run AI vision model
+guess = classify_issue_from_photo(bytes_data)
+s["issue_type"] = guess
+s["step"] = "ask_severity"
+
+loc_msg = "I detected a GPS location." if lat and lon else "I couldn’t read GPS from the photo."
+return JSONResponse({
+    "reply": f"Photo received ✔️. {loc_msg}\nI think this looks like: {guess}.\nCan you confirm severity? (minor, moderate, severe). Is a lane blocked?",
+    "done": False
+})
 
     # Handle text depending on state
     if s["step"] in ["start", None]:
