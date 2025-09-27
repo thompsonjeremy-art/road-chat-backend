@@ -1,4 +1,4 @@
-import os, io, re, sqlite3, uuid, pathlib, datetime, base64, logging
+import os, io, re, json, sqlite3, uuid, pathlib, datetime, base64, logging
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,11 +78,12 @@ def ensure_session(session_id: str):
             "lat": None,
             "lon": None,
             "photo_path": None,
+            "meta": {},            # for proposals/debug
             "step": "start"
         }
     return SESSIONS[session_id]
 
-# ---------- Helpers ----------
+# ---------- Helpers: EXIF / images ----------
 def parse_exif_gps(image_bytes: bytes):
     try:
         im = Image.open(io.BytesIO(image_bytes))
@@ -119,35 +120,45 @@ def save_photo(file: UploadFile) -> tuple[str, bytes]:
         f.write(data)
     return str(path), data
 
-def parse_route_mp(text: str):
-    t = text.lower()
-    mp = None
-    m = re.search(r"(mile|mp)\s*([0-9]+(?:\.[0-9]+)?)", t)
-    if m:
-        try: mp = float(m.group(2))
-        except: mp = None
-    route = text.strip()
-    return route, mp
+def prepare_image_b64(image_bytes: bytes) -> str:
+    """Downscale & JPEG-encode to keep payload small and consistent."""
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        im.thumbnail((1280, 1280))  # keep aspect ratio
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return base64.b64encode(image_bytes).decode("utf-8")
 
+# ---------- Helpers: parsing & normalization ----------
 SEV_WORDS = {"minor":"minor","moderate":"moderate","medium":"moderate","severe":"severe","major":"severe"}
 
 def parse_severity(text: str) -> Optional[str]:
-    t = text.lower()
+    t = (text or "").lower()
     for k,v in SEV_WORDS.items():
         if k in t:
             return v
     return None
 
-# ✅ Improved: handle plain yes/no and phrases
+def normalize_severity(label: Optional[str]) -> Optional[str]:
+    if not label: return None
+    t = label.lower().strip()
+    if "minor" in t: return "minor"
+    if "moderate" in t or "medium" in t: return "moderate"
+    if "severe" in t or "major" in t: return "severe"
+    return None
+
+# ✅ Improved lane parsing (supports plain yes/no and phrases)
 def parse_lane_blocked(text: str) -> Optional[int]:
-    t = text.lower().strip()
+    t = (text or "").lower().strip()
     # explicit phrases
     if "lane" in t or "lanes" in t or "traffic" in t:
         if any(w in t for w in ["not blocked","unblocked","open","flowing","moving","clear","no issues"]):
             return 0
-        if any(w in t for w in ["blocked","closed","shut","impassable","stopped"]):
+        if any(w in t for w in ["lane blocked","lanes blocked","blocked","closed","shut","impassable","stopped"]):
             return 1
-    # plain yes/no answers (when we're prompting about lanes)
+    # plain yes/no
     if t in ["no","nope","nah","negative","n"]:
         return 0
     if t in ["yes","yep","yeah","affirmative","y"]:
@@ -176,22 +187,58 @@ def normalize_issue(label: str) -> str:
         return "snow_ice"
     return "unknown"
 
-def prepare_image_b64(image_bytes: bytes) -> str:
-    """Downscale & JPEG-encode to keep payload small and consistent."""
-    try:
-        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        im.thumbnail((1280, 1280))  # keep aspect ratio
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=85, optimize=True)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-    except Exception:
-        return base64.b64encode(image_bytes).decode("utf-8")
+# ---- Better route/MP parsing (only pick real road names) ----
+ROAD_WORDS = r"(?:highway|hwy|road|rd|street|st|avenue|ave|drive|dr|blvd|boulevard|lane|ln|way|pkwy|parkway|court|ct|place|pl|trail|trl|circle|cir)"
+ROUTE_TOKEN  = r"[A-Za-z0-9 .'\-]+?"
 
+def normalize_route(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    if not re.search(rf"\b{ROAD_WORDS}\b", s, re.IGNORECASE):
+        return None
+    s = re.sub(r"\s+", " ", s).strip(" .,-")
+    s = " ".join(w if w.isupper() and len(w) <= 4 else w.capitalize() for w in s.split())
+    return s[:80]
+
+def parse_route_mp(text: str) -> tuple[Optional[str], Optional[float]]:
+    t = text.strip()
+
+    # Milepost anywhere
+    mp = None
+    m_mp = re.search(r"\b(?:mile|mp)\s*([0-9]+(?:\.[0-9]+)?)\b", t, re.IGNORECASE)
+    if m_mp:
+        try:
+            mp = float(m_mp.group(1))
+        except:
+            mp = None
+
+    route = None
+
+    # Pattern A: “… on/along/near/at <ROUTE> …”
+    m_on = re.search(rf"\b(?:on|along|near|at)\s+({ROUTE_TOKEN}\b{ROAD_WORDS}\b)", t, re.IGNORECASE)
+    if m_on:
+        route = normalize_route(m_on.group(1))
+        if route:
+            return route, mp
+
+    # Pattern B: “<ROUTE> … mile/mp …”
+    m_before_mp = re.search(rf"\b({ROUTE_TOKEN}\b{ROAD_WORDS}\b)[^\.]*?\b(?:mile|mp)\b", t, re.IGNORECASE)
+    if m_before_mp:
+        route = normalize_route(m_before_mp.group(1))
+        if route:
+            return route, mp
+
+    # Pattern C: trailing “… at <ROUTE>”
+    m_at = re.search(rf"\bat\s+({ROUTE_TOKEN}\b{ROAD_WORDS}\b)\b", t, re.IGNORECASE)
+    if m_at:
+        route = normalize_route(m_at.group(1))
+        if route:
+            return route, mp
+
+    return None, mp
+
+# ---------- Vision: issue classification ----------
 def classify_issue_from_photo(photo_bytes: bytes) -> tuple[str, str]:
-    """
-    Returns (normalized_label, raw_model_reply).
-    Uses OpenAI vision with few-shot and deterministic settings.
-    """
+    """Returns (normalized_label, raw_model_reply)."""
     b64 = prepare_image_b64(photo_bytes)
     try:
         resp = client.chat.completions.create(
@@ -220,22 +267,106 @@ def classify_issue_from_photo(photo_bytes: bytes) -> tuple[str, str]:
                 },
             ],
         )
-        raw = resp.choices[0].message.content.strip()
+        raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
         raw = f"error:{e}"
 
     label = normalize_issue(raw)
     if DEBUG:
-        log.info(f"[VISION] raw='{raw}' -> normalized='{label}'")
+        log.info(f"[VISION issue] raw='{raw}' -> '{label}'")
     return label, raw
 
+# ---------- NEW: severity & blockage proposals ----------
+def parse_severity_from_text(text: str) -> tuple[Optional[str], float]:
+    t = (text or "").lower()
+    if "severe" in t or "major" in t: return ("severe", 0.9)
+    if "moderate" in t or "medium" in t: return ("moderate", 0.8)
+    if "minor" in t or "small" in t or "low" in t: return ("minor", 0.8)
+    return (None, 0.0)
+
+def parse_blocked_from_text(text: str) -> tuple[Optional[int], float]:
+    t = (text or "").lower().strip()
+    if any(k in t for k in ["not blocked","unblocked","open","flowing","moving","no blockage"]): return (0, 0.9)
+    if any(k in t for k in ["lane blocked","lanes blocked","blocked","closed","shut","impassable","stopped"]): return (1, 0.9)
+    if t in ["no","nope","nah","negative","n"]: return (0, 0.9)
+    if t in ["yes","yep","yeah","affirmative","y"]: return (1, 0.9)
+    return (None, 0.0)
+
+def vision_severity_and_blocked(photo_b64: str) -> dict:
+    """
+    Returns: {"severity": str|None, "severity_conf": float,
+              "blocked": int|None, "blocked_conf": float, "raw": str}
+    """
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=80,
+            messages=[
+                {"role":"system","content":
+                 ("You are a road maintenance inspector. "
+                  "From the photo, estimate: (1) severity (minor, moderate, severe) "
+                  "based on hazard/damage extent/vehicle impact; "
+                  "(2) is a traffic lane blocked (yes/no/unknown). "
+                  "Return JSON ONLY with keys: severity, severity_conf (0-1), "
+                  "blocked (yes/no/unknown), blocked_conf (0-1).")},
+                {"role":"user","content":[
+                    {"type":"text","text":"Analyze this photo and output JSON only."},
+                    {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{photo_b64}"}}
+                ]}
+            ]
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        d = json.loads(raw) if raw.startswith("{") else {}
+        sev = normalize_severity(d.get("severity"))
+        blk = (d.get("blocked","unknown") or "").lower()
+        blocked = 1 if blk=="yes" else 0 if blk=="no" else None
+        sev_conf = float(d.get("severity_conf", 0))
+        blk_conf = float(d.get("blocked_conf", 0))
+        return {"severity": sev, "severity_conf": sev_conf, "blocked": blocked, "blocked_conf": blk_conf, "raw": raw}
+    except Exception as e:
+        return {"severity": None, "severity_conf": 0.0, "blocked": None, "blocked_conf": 0.0, "raw": f"error:{e}"}
+
+def propose_severity_and_blocked(photo_bytes: Optional[bytes], user_text: Optional[str]) -> dict:
+    """
+    Combines text cues and (if available) vision to propose severity & blocked with confidence.
+    Returns: {"severity": str|None, "severity_conf": float,
+              "blocked": int|None, "blocked_conf": float, "raw_vision": str|None}
+    """
+    best_sev, best_sev_conf = None, 0.0
+    best_blk, best_blk_conf = None, 0.0
+
+    # 1) text first (cheap)
+    ts, ts_conf = parse_severity_from_text(user_text or "")
+    tb, tb_conf = parse_blocked_from_text(user_text or "")
+    if ts: best_sev, best_sev_conf = ts, ts_conf
+    if tb is not None: best_blk, best_blk_conf = tb, tb_conf
+
+    raw_vis = None
+    # 2) vision if we have a photo and confidence is low
+    if photo_bytes and (best_sev_conf < 0.85 or best_blk_conf < 0.85):
+        b64 = prepare_image_b64(photo_bytes)
+        v = vision_severity_and_blocked(b64)
+        raw_vis = v.get("raw")
+        if v.get("severity") and v.get("severity_conf",0) > best_sev_conf:
+            best_sev, best_sev_conf = v["severity"], v["severity_conf"]
+        if v.get("blocked") is not None and v.get("blocked_conf",0) > best_blk_conf:
+            best_blk, best_blk_conf = v["blocked"], v["blocked_conf"]
+
+    return {
+        "severity": best_sev, "severity_conf": best_sev_conf,
+        "blocked": best_blk, "blocked_conf": best_blk_conf,
+        "raw_vision": raw_vis
+    }
+
+# ---------- Extract all from text ----------
 def extract_all_from_text(s: dict, text: str):
     """
     Fill any missing fields from a free-form user message.
     - issue_type via normalize_issue
     - route & milepost via parse_route_mp
-    - severity via parse_severity
-    - lane_blocked via parse_lane_blocked
+    - severity via parse_severity/parse_severity_from_text
+    - lane_blocked via parse_lane_blocked/parse_blocked_from_text
     """
     if not s.get("issue_type") or s["issue_type"] == "unknown":
         cand = normalize_issue(text)
@@ -248,6 +379,7 @@ def extract_all_from_text(s: dict, text: str):
     if mp is not None and s.get("milepost") is None:
         s["milepost"] = mp
 
+    # primary rules
     sev = parse_severity(text)
     if sev and not s.get("severity"):
         s["severity"] = sev
@@ -255,6 +387,14 @@ def extract_all_from_text(s: dict, text: str):
     lb = parse_lane_blocked(text)
     if lb is not None and s.get("lane_blocked") is None:
         s["lane_blocked"] = lb
+
+    # secondary (confidence-scored) text cues
+    if not s.get("severity"):
+        ts, _ = parse_severity_from_text(text or "")
+        if ts: s["severity"] = ts
+    if s.get("lane_blocked") is None:
+        tb, _ = parse_blocked_from_text(text or "")
+        if tb is not None: s["lane_blocked"] = tb
 
 def next_missing_fields(s: dict) -> list[str]:
     fields = []
@@ -284,9 +424,16 @@ async def vision_test(photo: UploadFile = File(...)):
     path, bytes_data = save_photo(photo)
     lat, lon = parse_exif_gps(bytes_data)
     label, raw = classify_issue_from_photo(bytes_data)
+    # propose severity/blocked
+    sv = propose_severity_and_blocked(photo_bytes=bytes_data, user_text=None)
     return {
         "label": label,
         "raw": raw if DEBUG else "(hidden; set DEBUG=true to expose)",
+        "severity_guess": sv["severity"],
+        "severity_conf": sv["severity_conf"],
+        "blocked_guess": sv["blocked"],
+        "blocked_conf": sv["blocked_conf"],
+        "sv_raw": sv["raw_vision"] if DEBUG else "(hidden)",
         "has_gps": bool(lat and lon),
         "saved_to": path
     }
@@ -296,41 +443,74 @@ async def chat(
     session_id: str = Form(...),
     text: Optional[str] = Form(None),
     photo: Optional[UploadFile] = File(None),
+    # Optional future: device lat/lon via form
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
 ):
     s = ensure_session(session_id)
 
-    # PHOTO RECEIVED → detect GPS + AI classify
+    # Device-provided coords (optional)
+    if lat is not None and lon is not None:
+        s["lat"], s["lon"] = float(lat), float(lon)
+
+    # PHOTO RECEIVED → detect GPS + classify + propose severity/blocked
     if photo is not None:
         path, bytes_data = save_photo(photo)
         s["photo_path"] = path
-        lat, lon = parse_exif_gps(bytes_data)
-        s["lat"], s["lon"] = lat, lon
+        exif_lat, exif_lon = parse_exif_gps(bytes_data)
+        if exif_lat and exif_lon:
+            s["lat"], s["lon"] = exif_lat, exif_lon
 
         ai_label, raw = classify_issue_from_photo(bytes_data)
         s["ai_guess"] = ai_label
 
-        loc_msg = "I detected a GPS location." if (lat and lon) else "I couldn’t read GPS from the photo."
+        # Proposals
+        sv = propose_severity_and_blocked(photo_bytes=bytes_data, user_text=None)
+        s["meta"]["sv"] = sv
+        if sv["severity"] and sv["severity_conf"] >= 0.75 and not s.get("severity"):
+            s["severity"] = sv["severity"]
+        if sv["blocked"] is not None and sv["blocked_conf"] >= 0.75 and s.get("lane_blocked") is None:
+            s["lane_blocked"] = sv["blocked"]
+
+        loc_msg = "I detected a GPS location." if (s.get("lat") and s.get("lon")) else "I couldn’t read GPS from the photo."
 
         if ai_label == "unknown":
             s["step"] = "ask_issue_type"
+            more = ""
+            if sv.get("severity"):
+                more += f"\n(Severity looks {sv['severity']} ~{sv['severity_conf']:.2f})"
+            if sv.get("blocked") is not None:
+                yn = "yes" if sv["blocked"]==1 else "no"
+                more += f"\n(Lane blocked looks {yn} ~{sv['blocked_conf']:.2f})"
             payload = {
-                "reply": f"Photo received ✔️. {loc_msg}\nI couldn’t confidently classify the issue.\n{issue_prompt()}",
+                "reply": f"Photo received ✔️. {loc_msg}\nI couldn’t confidently classify the issue.{more}\n{issue_prompt()}",
                 "done": False
             }
-            if DEBUG: payload["model_raw"] = raw
+            if DEBUG:
+                payload["model_raw"] = raw
+                if sv.get("raw_vision"): payload["sv_raw"] = sv["raw_vision"]
             return JSONResponse(payload)
 
         # otherwise proceed to confirmation
         s["step"] = "confirm_issue"
+        extra = ""
+        if not s.get("severity") and sv.get("severity"):
+            extra += f"\nI estimate severity: {sv['severity']} ({sv['severity_conf']:.2f})."
+        if s.get("lane_blocked") is None and sv.get("blocked") is not None:
+            yn = "yes" if sv["blocked"]==1 else "no"
+            extra += f"\nI think a lane is blocked: {yn} ({sv['blocked_conf']:.2f})."
+
         payload = {
             "reply": (
                 f"Photo received ✔️. {loc_msg}\n"
-                f"I think this looks like: {ai_label}.\n"
+                f"I think this looks like: {ai_label}.{extra}\n"
                 "Is that right? (yes/no, or tell me the correct type)"
             ),
             "done": False
         }
-        if DEBUG: payload["model_raw"] = raw
+        if DEBUG:
+            payload["model_raw"] = raw
+            if sv.get("raw_vision"): payload["sv_raw"] = sv["raw_vision"]
         return JSONResponse(payload)
 
     # TEXT: always try to extract facts
@@ -343,11 +523,17 @@ async def chat(
             t = text.strip().lower()
             if t in ["yes","y","correct","right","yep","yeah"]:
                 s["issue_type"] = s.get("ai_guess") or s.get("issue_type") or "unknown"
+                # Apply severity proposal if still missing
+                sv = (s.get("meta") or {}).get("sv") or {}
+                if not s.get("severity") and sv.get("severity") and sv.get("severity_conf",0) >= 0.5:
+                    s["severity"] = sv["severity"]
+                if s.get("lane_blocked") is None and sv.get("blocked") is not None and sv.get("blocked_conf",0) >= 0.5:
+                    s["lane_blocked"] = sv["blocked"]
             elif t in ["no","n","incorrect","wrong"]:
                 s["step"] = "ask_issue_type"
                 return JSONResponse({"reply": "Thanks. " + issue_prompt(), "done": False})
             else:
-                # free-form correction already normalized above
+                # free-form correction already normalized by extract_all_from_text above
                 if not s.get("issue_type") or s["issue_type"] == "unknown":
                     s["step"] = "ask_issue_type"
                     return JSONResponse({"reply": issue_prompt(), "done": False})
@@ -384,12 +570,13 @@ async def chat(
                  s.get("photo_path"), datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z"))
             conn.commit(); conn.close()
             s["step"] = "done"
+            mp_txt = f"MP {round(s['milepost'], 2)}" if s.get('milepost') is not None else "(MP unknown)"
+            route_txt = s.get('route') or '(unknown road)'
             return JSONResponse({
                 "reply": (
                     "Logged ✅\n"
                     f"Issue: {s['issue_type'] or 'unknown'}\n"
-                    f"Route: {s.get('route') or '(unknown road)'}\n"
-                    f"Milepost: {s.get('milepost') if s.get('milepost') is not None else '(unknown MP)'}\n"
+                    f"Route: {route_txt} {mp_txt}\n"
                     f"Severity: {s.get('severity') or '(unspecified)'}\n"
                     f"Lane blocked: {'yes' if s.get('lane_blocked') else 'no' if s.get('lane_blocked') == 0 else '(unspecified)'}"
                 ),
@@ -402,9 +589,18 @@ async def chat(
         if "route" in missing or "milepost" in missing:
             asks.append("the road name and nearest milepost/intersection")
         if "severity" in missing:
-            asks.append("severity (minor, moderate, severe)")
+            sv = (s.get("meta") or {}).get("sv") or {}
+            if sv.get("severity"):
+                asks.append(f"severity (minor, moderate, severe) — I’d guess {sv['severity']}")
+            else:
+                asks.append("severity (minor, moderate, severe)")
         if "lane_blocked" in missing:
-            asks.append("whether a lane is blocked")
+            sv = (s.get("meta") or {}).get("sv") or {}
+            if sv.get("blocked") is not None:
+                yn = "yes" if sv["blocked"]==1 else "no"
+                asks.append(f"whether a lane is blocked — I’d guess {yn}")
+            else:
+                asks.append("whether a lane is blocked")
         return JSONResponse({"reply": "Got it. Could you tell me " + "; and ".join(asks) + "?", "done": False})
 
     # DONE
