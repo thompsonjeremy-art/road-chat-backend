@@ -63,6 +63,22 @@ init_db()
 SESSIONS = {}
 ISSUE_CHOICES = ["pothole", "cracking", "shoulder_drop", "guardrail", "sign", "drainage", "debris", "snow_ice"]
 
+def ensure_session(session_id: str):
+    if session_id not in SESSIONS:
+        SESSIONS[session_id] = {
+            "route": None,
+            "milepost": None,
+            "issue_type": None,        # FINAL confirmed label
+            "ai_guess": None,          # AI's proposed label
+            "severity": None,
+            "lane_blocked": None,
+            "lat": None,
+            "lon": None,
+            "photo_path": None,
+            "step": "start"
+        }
+    return SESSIONS[session_id]
+
 # ---------- Helpers ----------
 def parse_exif_gps(image_bytes: bytes):
     try:
@@ -100,21 +116,6 @@ def save_photo(file: UploadFile) -> tuple[str, bytes]:
         f.write(data)
     return str(path), data
 
-def ensure_session(session_id: str):
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = {
-            "route": None,
-            "milepost": None,
-            "issue_type": None,
-            "severity": None,
-            "lane_blocked": None,
-            "lat": None,
-            "lon": None,
-            "photo_path": None,
-            "step": "start"
-        }
-    return SESSIONS[session_id]
-
 def parse_route_mp(text: str):
     t = text.lower()
     mp = None
@@ -126,23 +127,45 @@ def parse_route_mp(text: str):
     return route, mp
 
 def normalize_issue(label: str) -> str:
+    """Map free text to our canonical set."""
     lab = (label or "").strip().lower()
     if lab in ISSUE_CHOICES: return lab
-    if "pothole" in lab: return "pothole"
-    if "crack" in lab: return "cracking"
-    if "shoulder" in lab: return "shoulder_drop"
-    if "guard" in lab: return "guardrail"
-    if "sign" in lab: return "sign"
-    if "drain" in lab or "culvert" in lab: return "drainage"
-    if "debris" in lab or "rock" in lab or "tree" in lab: return "debris"
-    if "snow" in lab or "ice" in lab: return "snow_ice"
+    # common synonyms / phrases
+    if "pothole" in lab or "hole" in lab or "pitted" in lab:
+        return "pothole"
+    if "crack" in lab or "split" in lab or "alligator" in lab:
+        return "cracking"
+    if "shoulder" in lab or "edge drop" in lab or "edge-drop" in lab or "drop off" in lab:
+        return "shoulder_drop"
+    if "guard" in lab or "rail" in lab:
+        return "guardrail"
+    if "sign" in lab or "marker" in lab:
+        return "sign"
+    if "drain" in lab or "culvert" in lab or "ditch" in lab or "flood" in lab:
+        return "drainage"
+    if "debris" in lab or "rock" in lab or "tree" in lab or "fallen" in lab:
+        return "debris"
+    if "snow" in lab or "ice" in lab or "packed" in lab or "slick" in lab:
+        return "snow_ice"
     return "unknown"
+
+def prepare_image_b64(image_bytes: bytes) -> str:
+    """Downscale & JPEG-encode to keep payload small and consistent."""
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        im.thumbnail((1280, 1280))  # keep aspect ratio; max side 1280px
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return base64.b64encode(image_bytes).decode("utf-8")
 
 def classify_issue_from_photo(photo_bytes: bytes) -> tuple[str, str]:
     """
     Returns (normalized_label, raw_model_reply).
+    Uses OpenAI vision with few-shot and deterministic settings.
     """
-    b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    b64 = prepare_image_b64(photo_bytes)
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -153,14 +176,14 @@ def classify_issue_from_photo(photo_bytes: bytes) -> tuple[str, str]:
                     "role": "system",
                     "content": (
                         "You are a road maintenance inspector. "
-                        "Look at road photos and respond with ONE word only from this list: "
+                        "Look only at the roadway in the photo and respond with ONE word from: "
                         "pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice, unknown. "
-                        "If unsure, answer unknown. No punctuation."
+                        "If unsure, reply unknown. No punctuation."
                     ),
                 },
-                {"role": "user", "content": "Example: broken asphalt hole with water → pothole"},
-                {"role": "user", "content": "Example: long linear splits in asphalt → cracking"},
-                {"role": "user", "content": "Example: snow- or ice-covered roadway → snow_ice"},
+                {"role": "user", "content": "Example: hole in asphalt (often with water) → pothole"},
+                {"role": "user", "content": "Example: many thin linear fissures in asphalt → cracking"},
+                {"role": "user", "content": "Example: snow or ice covering lanes → snow_ice"},
                 {
                     "role": "user",
                     "content": [
@@ -205,43 +228,66 @@ async def chat(
 ):
     s = ensure_session(session_id)
 
-    # Photo path
+    # PHOTO RECEIVED → detect GPS + AI classify → ask for confirmation
     if photo is not None:
         path, bytes_data = save_photo(photo)
         s["photo_path"] = path
         lat, lon = parse_exif_gps(bytes_data)
         s["lat"], s["lon"] = lat, lon
 
-        # Vision classification
-        guess, raw = classify_issue_from_photo(bytes_data)
-        s["issue_type"] = guess
-        s["step"] = "ask_severity"
+        ai_label, raw = classify_issue_from_photo(bytes_data)
+        s["ai_guess"] = ai_label
+        s["step"] = "confirm_issue"
+
         loc_msg = "I detected a GPS location." if (lat and lon) else "I couldn’t read GPS from the photo."
         reply = (
             f"Photo received ✔️. {loc_msg}\n"
-            f"I think this looks like: {guess}.\n"
-            "Can you confirm severity? (minor, moderate, severe). Is a lane blocked?"
+            f"I think this looks like: {ai_label}.\n"
+            "Is that right? (yes/no, or tell me the correct type)"
         )
         payload = {"reply": reply, "done": False}
         if DEBUG:
             payload["model_raw"] = raw
         return JSONResponse(payload)
 
-    # Flow after photo
+    # START (no photo yet)
     if s["step"] in ["start", None]:
         return JSONResponse({
-            "reply": "Please attach a photo of the issue or describe the road and nearest milepost/intersection.",
+            "reply": "Please attach a photo of the issue if you can. Otherwise, tell me the road and nearest milepost/intersection.",
             "done": False
         })
 
+    # CONFIRMATION STEP
+    if s["step"] == "confirm_issue":
+        if not text:
+            return JSONResponse({"reply": "Is my guess correct? (yes/no, or name the correct type)", "done": False})
+        t = text.strip().lower()
+        if t in ["yes", "y", "correct", "right"]:
+            s["issue_type"] = s.get("ai_guess") or "unknown"
+        elif t in ["no", "n", "incorrect", "wrong"]:
+            s["issue_type"] = "unknown"
+        else:
+            # user gave a label like "hole in the road" → normalize
+            s["issue_type"] = normalize_issue(t)
+
+        # If we still have unknown AND no GPS, ask for location; else severity next
+        if s["lat"] is None or s["lon"] is None:
+            s["step"] = "ask_location"
+            return JSONResponse({"reply": "What road and nearest milepost or intersection is this?", "done": False})
+        else:
+            s["step"] = "ask_severity"
+            return JSONResponse({"reply": "Thanks. How severe is it? (minor, moderate, severe). Is a lane blocked?", "done": False})
+
+    # ASK LOCATION (no GPS in photo)
     if s["step"] == "ask_location":
         if not text:
-            return JSONResponse({"reply": "Please provide the road name and nearest milepost/intersection.", "done": False})
+            return JSONResponse({"reply": "Please provide the road name and nearest milepost or intersection.", "done": False})
         route, mp = parse_route_mp(text)
         s["route"], s["milepost"] = route, mp
         s["step"] = "ask_severity"
         return JSONResponse({"reply": "Got it. How severe is it? (minor, moderate, severe). Is a lane blocked?", "done": False})
 
+    # ASK SEVERITY (final before save)
     if s["step"] == "ask_severity":
         if not text:
             return JSONResponse({"reply": "Please rate severity (minor, moderate, severe) and whether a lane is blocked.", "done": False})
@@ -270,16 +316,18 @@ async def chat(
                 "Logged ✅\n"
                 f"Route: {s['route'] or '(unknown road)'}\n"
                 f"Milepost: {s['milepost'] or '(unknown MP)'}\n"
-                f"Issue: {s['issue_type']}\n"
+                f"Issue: {s['issue_type'] or (s.get('ai_guess') or 'unknown')}\n"
                 f"Severity: {s['severity']}\n"
                 f"Lane blocked: {'yes' if s['lane_blocked'] else 'no'}"
             ),
             "done": True
         })
 
+    # DONE
     if s["step"] == "done":
         return JSONResponse({"reply": "Report already completed for this session. Reset to start a new one.", "done": True})
 
+    # Fallback
     return JSONResponse({"reply": "I didn’t catch that. Try attaching a photo or answering the last question.", "done": False})
 
 @app.get("/export.csv")
