@@ -125,29 +125,60 @@ def parse_route_mp(text: str):
     return route, mp
 
 def classify_issue_from_photo(photo_bytes: bytes) -> str:
-    """Send photo to OpenAI Vision model and ask for classification."""
+    """Classify a road issue from a photo using OpenAI Vision.
+    Returns exactly one of ISSUE_CHOICES or 'unknown'.
+    """
     b64 = base64.b64encode(photo_bytes).decode("utf-8")
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Vision-capable model
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",          # vision-capable
+            temperature=0,                # deterministic
+            max_tokens=10,
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a road maintenance inspector. Classify visible road issues."
+                    "content": (
+                        "You are a road maintenance inspector. "
+                        "When given a photo, respond with EXACTLY one word from this list: "
+                        "pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice, unknown. "
+                        "If unsure, answer 'unknown'. No sentences, no punctuation."
+                    )
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Classify the road issue. Options: pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice. Respond with one word."},
+                        {"type": "text", "text": "Classify this road photo. One word only from the list."},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
                     ]
                 }
             ],
-            max_tokens=50
         )
-        return response.choices[0].message.content.strip().lower()
+        guess = resp.choices[0].message.content.strip().lower()
     except Exception:
         return "unknown"
+
+    # Normalize common variants to our allowed labels
+    if guess not in ISSUE_CHOICES:
+        if "pothole" in guess:
+            guess = "pothole"
+        elif "crack" in guess:
+            guess = "cracking"
+        elif "shoulder" in guess:
+            guess = "shoulder_drop"
+        elif "guard" in guess:
+            guess = "guardrail"
+        elif "sign" in guess:
+            guess = "sign"
+        elif "drain" in guess or "culvert" in guess:
+            guess = "drainage"
+        elif "debris" in guess or "rock" in guess or "tree" in guess:
+            guess = "debris"
+        elif "snow" in guess or "ice" in guess:
+            guess = "snow_ice"
+        else:
+            guess = "unknown"
+
+    return guess
 
 # ---- Routes ----
 @app.get("/health")
