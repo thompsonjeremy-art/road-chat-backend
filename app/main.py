@@ -1,41 +1,13 @@
-from openai import OpenAI
-import base64, os
-
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-def classify_issue_from_photo(photo_bytes: bytes) -> str:
-    """Send photo to OpenAI Vision model and ask for classification."""
-    b64 = base64.b64encode(photo_bytes).decode("utf-8")
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # vision-capable model
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a road maintenance inspector. Classify road problems in images."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Classify the road issue. Options: pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice. Respond with one word."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                    ]
-                }
-            ],
-            max_tokens=50
-        )
-        return response.choices[0].message.content.strip().lower()
-    except Exception as e:
-        return "unknown"
-
-import os, io, re, sqlite3, uuid, pathlib, datetime
+import os, io, re, sqlite3, uuid, pathlib, datetime, base64
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from PIL import Image
 import piexif
+from openai import OpenAI
 
+# Setup paths
 APP_DIR = pathlib.Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / ".." / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -44,9 +16,12 @@ DB_PATH = DATA_DIR / "reports.db"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# OpenAI client
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
 app = FastAPI(title="Road Chat Backend (PoC)")
 
-# ---- CORS (allow everything for PoC; tighten later) ----
+# ---- CORS (open for PoC) ----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -80,11 +55,10 @@ def init_db():
 init_db()
 
 # ---- In-memory session state ----
-# For PoC only (not persistent). Keyed by session_id.
 SESSIONS = {}
-
 ISSUE_CHOICES = ["pothole", "cracking", "shoulder_drop", "guardrail", "sign", "drainage", "debris", "snow_ice"]
 
+# ---- Helpers ----
 def parse_exif_gps(image_bytes: bytes):
     try:
         im = Image.open(io.BytesIO(image_bytes))
@@ -139,7 +113,6 @@ def ensure_session(session_id: str):
     return SESSIONS[session_id]
 
 def parse_route_mp(text: str):
-    # Very naive parse. Looks for "mile 23" or "mp 12.4", returns float if found.
     t = text.lower()
     mp = None
     m = re.search(r"(mile|mp)\s*([0-9]+(?:\.[0-9]+)?)", t)
@@ -148,10 +121,35 @@ def parse_route_mp(text: str):
             mp = float(m.group(2))
         except:
             mp = None
-    # naive route capture: keep whole text as route for PoC
     route = text.strip()
     return route, mp
 
+def classify_issue_from_photo(photo_bytes: bytes) -> str:
+    """Send photo to OpenAI Vision model and ask for classification."""
+    b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Vision-capable model
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a road maintenance inspector. Classify visible road issues."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Classify the road issue. Options: pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice. Respond with one word."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }
+            ],
+            max_tokens=50
+        )
+        return response.choices[0].message.content.strip().lower()
+    except Exception:
+        return "unknown"
+
+# ---- Routes ----
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -160,47 +158,35 @@ def health():
 async def chat(session_id: str = Form(...), text: Optional[str] = Form(None), photo: Optional[UploadFile] = File(None)):
     s = ensure_session(session_id)
 
-    # If photo uploaded, save it and try EXIF GPS
+    # Handle photo upload
     if photo is not None:
         path, bytes_data = save_photo(photo)
         s["photo_path"] = path
         lat, lon = parse_exif_gps(bytes_data)
-s["lat"], s["lon"] = lat, lon
+        s["lat"], s["lon"] = lat, lon
 
-# Run AI vision model
-guess = classify_issue_from_photo(bytes_data)
-s["issue_type"] = guess
-s["step"] = "ask_severity"
+        # Run AI vision model
+        guess = classify_issue_from_photo(bytes_data)
+        s["issue_type"] = guess
+        s["step"] = "ask_severity"
 
-loc_msg = "I detected a GPS location." if lat and lon else "I couldn’t read GPS from the photo."
-return JSONResponse({
-    "reply": f"Photo received ✔️. {loc_msg}\nI think this looks like: {guess}.\nCan you confirm severity? (minor, moderate, severe). Is a lane blocked?",
-    "done": False
-})
+        loc_msg = "I detected a GPS location." if lat and lon else "I couldn’t read GPS from the photo."
+        return JSONResponse({
+            "reply": f"Photo received ✔️. {loc_msg}\nI think this looks like: {guess}.\nCan you confirm severity? (minor, moderate, severe). Is a lane blocked?",
+            "done": False
+        })
 
-    # Handle text depending on state
+    # Handle conversation flow
     if s["step"] in ["start", None]:
-        return JSONResponse({"reply": "Please attach a photo of the issue if you can. Otherwise, describe the road and nearest milepost/intersection.", "done": False})
+        return JSONResponse({"reply": "Please attach a photo of the issue or describe the road and nearest milepost/intersection.", "done": False})
 
     if s["step"] == "ask_location":
         if not text:
-            return JSONResponse({"reply": "Please provide the road name and the nearest milepost or intersection.", "done": False})
+            return JSONResponse({"reply": "Please provide the road name and nearest milepost/intersection.", "done": False})
         route, mp = parse_route_mp(text)
         s["route"], s["milepost"] = route, mp
-        s["step"] = "classify_or_confirm"
-        return JSONResponse({"reply": "Got it. What is the problem type? (pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice)", "done": False})
-
-    if s["step"] == "classify_or_confirm":
-        if not text:
-            return JSONResponse({"reply": "What is the problem type? (pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice)", "done": False})
-        t = text.strip().lower().replace(" ", "_")
-        match = None
-        for ch in ISSUE_CHOICES:
-            if ch in t:
-                match = ch; break
-        s["issue_type"] = match or "unknown"
         s["step"] = "ask_severity"
-        return JSONResponse({"reply": "Thanks. How severe is it? (minor, moderate, severe). Is a lane blocked? You can reply like: 'severe, lane not blocked'.", "done": False})
+        return JSONResponse({"reply": "Got it. How severe is it? (minor, moderate, severe). Is a lane blocked?", "done": False})
 
     if s["step"] == "ask_severity":
         if not text:
@@ -218,7 +204,7 @@ return JSONResponse({
         cur = conn.cursor()
         cur.execute("""INSERT INTO reports 
             (id, session_id, route, milepost, issue_type, severity, lane_blocked, lat, lon, photo_path, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""" ,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
             (rid, session_id, s["route"], s["milepost"], s["issue_type"], s["severity"], s["lane_blocked"],
              s["lat"], s["lon"], s["photo_path"],
              datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z"
@@ -226,14 +212,15 @@ return JSONResponse({
         conn.commit()
         conn.close()
         s["step"] = "done"
-        route_disp = s["route"] or "(unknown road)"
-        mp_disp = s["milepost"] if s["milepost"] is not None else "(unknown MP)"
-        return JSONResponse({"reply": f"Logged ✅\nRoute: {route_disp}\nMilepost: {mp_disp}\nIssue: {s['issue_type']}\nSeverity: {s['severity']}\nLane blocked: {'yes' if s['lane_blocked'] else 'no'}", "done": True})
+        return JSONResponse({
+            "reply": f"Logged ✅\nRoute: {s['route'] or '(unknown road)'}\nMilepost: {s['milepost'] or '(unknown MP)'}\nIssue: {s['issue_type']}\nSeverity: {s['severity']}\nLane blocked: {'yes' if s['lane_blocked'] else 'no'}",
+            "done": True
+        })
 
     if s["step"] == "done":
-        return JSONResponse({"reply": "Report already completed for this session. You can reset the session in the UI to start a new report.", "done": True})
+        return JSONResponse({"reply": "Report already completed for this session. Reset to start a new one.", "done": True})
 
-    return JSONResponse({"reply": "I didn’t catch that. Try attaching a photo or answer the last question.", "done": False})
+    return JSONResponse({"reply": "I didn’t catch that. Try attaching a photo or answering the last question.", "done": False})
 
 @app.get("/export.csv")
 def export_csv():
