@@ -138,13 +138,20 @@ def parse_severity(text: str) -> Optional[str]:
             return v
     return None
 
+# ✅ Improved: handle plain yes/no and phrases
 def parse_lane_blocked(text: str) -> Optional[int]:
-    t = text.lower()
-    if "lane" in t or "lanes" in t:
-        if "not blocked" in t or "unblocked" in t or "open" in t or "no" in t:
+    t = text.lower().strip()
+    # explicit phrases
+    if "lane" in t or "lanes" in t or "traffic" in t:
+        if any(w in t for w in ["not blocked","unblocked","open","flowing","moving","clear","no issues"]):
             return 0
-        if "blocked" in t or "closed" in t or "impassable" in t:
+        if any(w in t for w in ["blocked","closed","shut","impassable","stopped"]):
             return 1
+    # plain yes/no answers (when we're prompting about lanes)
+    if t in ["no","nope","nah","negative","n"]:
+        return 0
+    if t in ["yes","yep","yeah","affirmative","y"]:
+        return 1
     return None
 
 def normalize_issue(label: str) -> str:
