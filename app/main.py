@@ -220,7 +220,6 @@ def vision_extract_all(photo_bytes: bytes) -> dict:
                   "- If uncertain, choose 'unknown' and keep confidences ≤ 0.5.\n"
                   "Return ONLY the JSON object."
                  )},
-                # Few-shot hints (for biasing, dummy images)
                 {"role":"user","content":[
                     {"type":"text","text":"Example: Large tree fully across a two-lane road."},
                     {"type":"image_url","image_url":{"url":"https://picsum.photos/seed/roadtree/400/220"}}
@@ -251,11 +250,54 @@ def vision_extract_all(photo_bytes: bytes) -> dict:
         "blocked_conf": float(data.get("blocked_conf", 0) or 0),
         "notes": data.get("notes") or ""
     }
-    # clamps
     for k in ["type_conf","severity_conf","blocked_conf"]:
         out[k] = max(0.0, min(1.0, out[k]))
     if DEBUG: log.info(f"[VISION all] {out}")
     return out
+
+# ---------- Natural-sounding reply writer ----------
+def natural_reply(state: dict, *, proposals: dict | None = None, asks: list[str] | None = None, context_note: str = "") -> str:
+    """
+    LLM writes a short, friendly message.
+    """
+    try:
+        asks = asks or []
+        p = proposals or {}
+        payload = {
+            "known": {
+                "issue_type": state.get("issue_type"),
+                "route": state.get("route"),
+                "milepost": state.get("milepost"),
+                "lat": state.get("lat"),
+                "lon": state.get("lon"),
+                "severity": state.get("severity"),
+                "lane_blocked": state.get("lane_blocked"),
+            },
+            "proposals": p,
+            "asks": asks[:2],
+            "note": context_note or ""
+        }
+        sys = (
+            "You are a concise, warm road-issue intake agent. "
+            "Write ONE short message (1–2 sentences). "
+            "Acknowledge what you understood, show any guessed values as soft suggestions "
+            "(e.g., “looks like moderate”), then ask at most ONE clear follow-up from the list. "
+            "Be natural and specific; avoid lists and multiple questions; no emojis unless user used them."
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            max_tokens=90,
+            messages=[
+                {"role":"system","content":sys},
+                {"role":"user","content":json.dumps(payload, ensure_ascii=False)}
+            ]
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text[:600] if text else "Got it. Could you help me with one more detail?"
+    except Exception:
+        ask = asks[0] if asks else "one more detail"
+        return f"Thanks, I’ve logged what I can. Could you tell me {ask}?"
 
 # ---------- Text extraction ----------
 def extract_all_from_text(s: dict, text: str):
@@ -281,7 +323,7 @@ def next_missing_fields(s: dict) -> list[str]:
     return missing
 
 def issue_prompt() -> str:
-    return "What best describes the issue? (pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice)"
+    return "the problem type (pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice)"
 
 # ---------- Endpoints ----------
 @app.get("/health")
@@ -292,11 +334,7 @@ async def vision_test(photo: UploadFile = File(...)):
     path, bytes_data = save_photo(photo)
     lat, lon = parse_exif_gps(bytes_data)
     vision = vision_extract_all(bytes_data)
-    return {
-        "vision": vision,
-        "has_gps": bool(lat and lon),
-        "saved_to": path
-    }
+    return {"vision": vision, "has_gps": bool(lat and lon), "saved_to": path}
 
 @app.post("/chat")
 async def chat(
@@ -323,7 +361,7 @@ async def chat(
         s["meta"]["vision_all"] = vision
         s["ai_guess"] = vision.get("type") or "unknown"
 
-        # Hard override for obvious contradictions (e.g., notes mention tree across road)
+        # Hard override for obvious contradictions
         notes = (vision.get("notes") or "").lower()
         if "tree" in notes or "log" in notes:
             if "across" in notes or "across road" in notes or "full width" in notes:
@@ -341,23 +379,29 @@ async def chat(
             if blk in ["yes","partial"] and bc >= 0.75: s["lane_blocked"] = 1
             elif blk == "no" and bc >= 0.75: s["lane_blocked"] = 0
 
-        loc_msg = "I detected a GPS location." if (s.get('lat') and s.get('lon')) else "I couldn’t read GPS from the photo."
+        loc_msg = "GPS found" if (s.get('lat') and s.get('lon')) else "no GPS from the photo"
 
-        # Build proposals line
-        props = []
-        if vision["type"] != "unknown": props.append(f"type **{vision['type']}** ({vision['type_conf']:.2f})")
-        if vision["severity"] != "unknown": props.append(f"severity **{vision['severity']}** ({vision['severity_conf']:.2f})")
+        # Build proposals for the writer
+        props = {}
+        if vision["type"] != "unknown": props["issue_type"] = vision["type"]
+        if vision["severity"] != "unknown": props["severity"] = vision["severity"]
         if vision["blocked"] != "unknown":
-            yn = "yes" if vision["blocked"] in ["yes","partial"] else "no"
-            props.append(f"lane blocked **{yn}** ({vision['blocked_conf']:.2f})")
-        prose = "I think this looks like: " + ", ".join(props) + "." if props else "I couldn’t confidently classify the issue."
+            props["lane_blocked"] = 1 if vision["blocked"] in ["yes","partial"] else 0
 
+        # Decide what to ask next
+        missing = next_missing_fields(s)
         if not s.get("issue_type"):
             s["step"] = "ask_issue_type"
-            return JSONResponse({"reply": f"Photo received ✔️. {loc_msg}\n{prose}\n{issue_prompt()}", "done": False})
+            reply = natural_reply(s, proposals=props, asks=[issue_prompt()], context_note=f"Photo received; {loc_msg}.")
+            return JSONResponse({"reply": reply, "done": False})
 
         s["step"] = "confirm_issue"
-        return JSONResponse({"reply": f"Photo received ✔️. {loc_msg}\n{prose}\nIs that right? (yes/no, or tell me the correct type)", "done": False})
+        follow = []
+        if not s.get("severity"): follow.append("the severity (minor, moderate, or severe)")
+        if s.get("lane_blocked") is None: follow.append("whether a lane is blocked (yes or no)")
+        note = "Please confirm the issue type I suggested, or tell me the correct one. " + f"({loc_msg})"
+        reply = natural_reply(s, proposals={"issue_type": s.get("ai_guess"), **({} if not props else props)}, asks=follow[:1], context_note=note)
+        return JSONResponse({"reply": reply, "done": False})
 
     # ---- TEXT path ----
     if text: extract_all_from_text(s, text)
@@ -370,19 +414,24 @@ async def chat(
                 s["issue_type"] = s.get("ai_guess") or s.get("issue_type") or "unknown"
             elif t in ["no","n","incorrect","wrong"]:
                 s["step"] = "ask_issue_type"
-                return JSONResponse({"reply": "Thanks. " + issue_prompt(), "done": False})
+                reply = natural_reply(s, asks=[issue_prompt()], context_note="Thanks for the correction.")
+                return JSONResponse({"reply": reply, "done": False})
             else:
                 if not s.get("issue_type") or s["issue_type"] == "unknown":
                     s["step"] = "ask_issue_type"
-                    return JSONResponse({"reply": issue_prompt(), "done": False})
+                    reply = natural_reply(s, asks=[issue_prompt()], context_note="I didn’t quite catch the type.")
+                    return JSONResponse({"reply": reply, "done": False})
         s["step"] = "ask_details"
 
     # Ask for type explicitly
     if s["step"] == "ask_issue_type":
-        if not text: return JSONResponse({"reply": issue_prompt(), "done": False})
+        if not text:
+            reply = natural_reply(s, asks=[issue_prompt()], context_note="")
+            return JSONResponse({"reply": reply, "done": False})
         s["issue_type"] = normalize_issue(text)
         if s["issue_type"] == "unknown":
-            return JSONResponse({"reply": "Sorry, I still didn’t catch that.\n" + issue_prompt(), "done": False})
+            reply = natural_reply(s, asks=[issue_prompt()], context_note="Sorry, I still didn’t catch that.")
+            return JSONResponse({"reply": reply, "done": False})
         s["step"] = "ask_details"
 
     # Start
@@ -390,7 +439,8 @@ async def chat(
         if text:
             s["step"] = "ask_details"
         else:
-            return JSONResponse({"reply": "Attach a photo if you can. Otherwise, tell me the issue and the road + milepost/intersection.", "done": False})
+            reply = natural_reply(s, asks=["a short description and the road + nearest milepost or intersection"], context_note="Ready when you are.")
+            return JSONResponse({"reply": reply, "done": False})
 
     # Ask details / Save when complete
     if s["step"] in ["ask_details","ask_location","ask_severity"]:
@@ -408,28 +458,25 @@ async def chat(
             s["step"] = "done"
             mp_txt = f"MP {round(s['milepost'],2)}" if s.get('milepost') is not None else "(MP unknown)"
             route_txt = s.get('route') or '(unknown road)'
-            return JSONResponse({
-                "reply": ("Logged ✅\n"
-                          f"Issue: {s['issue_type'] or 'unknown'}\n"
-                          f"Route: {route_txt} {mp_txt}\n"
-                          f"Severity: {s.get('severity') or '(unspecified)'}\n"
-                          f"Lane blocked: {'yes' if s.get('lane_blocked') else 'no' if s.get('lane_blocked') == 0 else '(unspecified)'}"),
-                "done": True
-            })
+            out = (
+                f"Logged ✅ I’ve saved your report.\n"
+                f"Issue: {s['issue_type'] or 'unknown'}\n"
+                f"Route: {route_txt} {mp_txt}\n"
+                f"Severity: {s.get('severity') or '(unspecified)'}\n"
+                f"Lane blocked: {'yes' if s.get('lane_blocked') else 'no' if s.get('lane_blocked') == 0 else '(unspecified)'}"
+            )
+            return JSONResponse({"reply": out, "done": True})
 
         asks = []
-        if "issue_type" in missing:
-            asks.append("the problem type (pothole, cracking, shoulder_drop, guardrail, sign, drainage, debris, snow_ice)")
-        if "route" in missing or "milepost" in missing:
-            asks.append("the road name and nearest milepost/intersection")
-        if "severity" in missing:
-            asks.append("severity (minor, moderate, severe)")
-        if "lane_blocked" in missing:
-            asks.append("whether a lane is blocked")
-        return JSONResponse({"reply":"Got it. Could you tell me " + "; and ".join(asks) + "?", "done": False})
+        if "issue_type" in missing: asks.append(issue_prompt())
+        if "route" in missing or "milepost" in missing: asks.append("the road name and the nearest milepost or intersection")
+        if "severity" in missing: asks.append("the severity (minor, moderate, or severe)")
+        if "lane_blocked" in missing: asks.append("whether a lane is blocked (yes or no)")
+        reply = natural_reply(s, asks=[asks[0]], context_note="")
+        return JSONResponse({"reply":"%s" % reply, "done": False})
 
     if s["step"] == "done":
-        return JSONResponse({"reply":"Report already completed for this session. Reset to start a new one.", "done": True})
+        return JSONResponse({"reply":"Report already completed for this session. Send another photo or describe a new issue to start a fresh report.", "done": True})
 
     return JSONResponse({"reply":"I didn’t catch that. Try attaching a photo or answering the last question.", "done": False})
 
