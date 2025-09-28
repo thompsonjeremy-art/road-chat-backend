@@ -62,16 +62,24 @@ def ensure_session(session_id: str):
         SESSIONS[session_id] = {
             "route": None,
             "milepost": None,
-            "issue_type": None,   # final
-            "ai_guess": None,     # vision type guess
+            "issue_type": None,
+            "ai_guess": None,
             "severity": None,
             "lane_blocked": None, # 1/0
             "lat": None, "lon": None,
             "photo_path": None,
-            "meta": {},           # stash proposals/raw
-            "step": "start"
+            "meta": {},
+            "step": "start",
+            "_last_req_id": None,
+            "_last_reply_json": None,
         }
     return SESSIONS[session_id]
+
+# ---------- Helpers ----------
+def send_json(s: dict, reply: str, done: bool = False) -> JSONResponse:
+    payload = {"reply": reply, "done": done}
+    s["_last_reply_json"] = payload
+    return JSONResponse(payload)
 
 # ---------- Image & EXIF ----------
 def parse_exif_gps(image_bytes: bytes):
@@ -135,11 +143,24 @@ def normalize_severity(label: Optional[str]) -> Optional[str]:
 
 def parse_severity(text: str) -> Optional[str]:
     t = (text or "").lower()
-    for k,v in SEV_WORDS.items():
-        if k in t: return v
+    # minor-ish
+    if any(w in t for w in ["minor","small","little","tiny","hairline","shallow","not bad","no big deal","light"]):
+        return "minor"
+    # severe-ish
+    if any(w in t for w in ["severe","major","big","huge","massive","deep","dangerous","bad","really bad","critical"]):
+        return "severe"
+    # moderate-ish
+    if any(w in t for w in ["moderate","medium","in between","so-so","ok-ish"]):
+        return "moderate"
+    # numeric hint (1–10)
+    m = re.search(r"\b([1-9]|10)\/?10\b", t)
+    if m:
+        n = int(m.group(1))
+        if n <= 3: return "minor"
+        if n >= 8: return "severe"
+        return "moderate"
     return None
 
-# Lane blocked: understand yes/no and phrasing
 def parse_lane_blocked(text: str) -> Optional[int]:
     t = (text or "").lower().strip()
     if "lane" in t or "lanes" in t or "traffic" in t:
@@ -149,9 +170,8 @@ def parse_lane_blocked(text: str) -> Optional[int]:
     if t in ["yes","yep","yeah","affirmative","y"]: return 1
     return None
 
-# Route + milepost (smarter)
-ROAD_WORDS = r"(?:highway|hwy|road|rd|street|st|avenue|ave|drive|dr|blvd|boulevard|lane|ln|way|pkwy|parkway|court|ct|place|pl|trail|trl|circle|cir)"
-ROUTE_TOKEN  = r"[A-Za-z0-9 .'\-]+?"
+ROAD_WORDS  = r"(?:highway|hwy|road|rd|street|st|avenue|ave|drive|dr|blvd|boulevard|lane|ln|way|pkwy|parkway|court|ct|place|pl|trail|trl|circle|cir)"
+ROUTE_TOKEN = r"[A-Za-z0-9 .'\-]+?"
 
 def normalize_route(s: Optional[str]) -> Optional[str]:
     if not s: return None
@@ -182,20 +202,8 @@ def parse_route_mp(text: str) -> tuple[Optional[str], Optional[float]]:
         if route: return route, mp
     return None, mp
 
-# ---------- Unified vision extractor (type + severity + blocked) ----------
+# ---------- Vision extractor (type + severity + blocked) ----------
 def vision_extract_all(photo_bytes: bytes) -> dict:
-    """
-    Returns:
-      {
-        "type":        pothole|cracking|shoulder_drop|guardrail|sign|drainage|debris|snow_ice|unknown,
-        "type_conf":   0..1,
-        "severity":    minor|moderate|severe|unknown,
-        "severity_conf":0..1,
-        "blocked":     yes|no|partial|unknown,
-        "blocked_conf":0..1,
-        "notes":       str
-      }
-    """
     b64 = prepare_image_b64(photo_bytes)
     try:
         resp = client.chat.completions.create(
@@ -257,9 +265,6 @@ def vision_extract_all(photo_bytes: bytes) -> dict:
 
 # ---------- Natural-sounding reply writer ----------
 def natural_reply(state: dict, *, proposals: dict | None = None, asks: list[str] | None = None, context_note: str = "") -> str:
-    """
-    LLM writes a short, friendly message.
-    """
     try:
         asks = asks or []
         p = proposals or {}
@@ -281,17 +286,13 @@ def natural_reply(state: dict, *, proposals: dict | None = None, asks: list[str]
             "You are a concise, warm road-issue intake agent. "
             "Write ONE short message (1–2 sentences). "
             "Acknowledge what you understood, show any guessed values as soft suggestions "
-            "(e.g., “looks like moderate”), then ask at most ONE clear follow-up from the list. "
-            "Be natural and specific; avoid lists and multiple questions; no emojis unless user used them."
+            "and ask at most ONE clear follow-up. Avoid lists and multiple questions."
         )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.3,
             max_tokens=90,
-            messages=[
-                {"role":"system","content":sys},
-                {"role":"user","content":json.dumps(payload, ensure_ascii=False)}
-            ]
+            messages=[{"role":"system","content":sys},{"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
         )
         text = (resp.choices[0].message.content or "").strip()
         return text[:600] if text else "Got it. Could you help me with one more detail?"
@@ -343,10 +344,17 @@ async def chat(
     photo: Optional[UploadFile] = File(None),
     lat: Optional[float] = Form(None),
     lon: Optional[float] = Form(None),
+    req_id: Optional[str] = Form(None),   # for de-dupe
 ):
     s = ensure_session(session_id)
 
-    # Device-provided coords (optional)
+    # --- de-dupe identical retries from client ---
+    if req_id:
+        if s.get("_last_req_id") == req_id and s.get("_last_reply_json"):
+            return JSONResponse(s["_last_reply_json"])
+        s["_last_req_id"] = req_id
+
+    # Device GPS (optional)
     if lat is not None and lon is not None:
         s["lat"], s["lon"] = float(lat), float(lon)
 
@@ -361,13 +369,12 @@ async def chat(
         s["meta"]["vision_all"] = vision
         s["ai_guess"] = vision.get("type") or "unknown"
 
-        # Hard override for obvious contradictions
+        # Obvious tree-across-road override
         notes = (vision.get("notes") or "").lower()
-        if "tree" in notes or "log" in notes:
-            if "across" in notes or "across road" in notes or "full width" in notes:
-                vision["blocked"] = "yes"; vision["blocked_conf"] = max(vision.get("blocked_conf",0), 0.9)
-                if vision.get("severity") == "unknown":
-                    vision["severity"] = "severe"; vision["severity_conf"] = max(vision.get("severity_conf",0), 0.85)
+        if ("tree" in notes or "log" in notes) and ("across" in notes or "full width" in notes or "across road" in notes):
+            vision["blocked"] = "yes"; vision["blocked_conf"] = max(vision.get("blocked_conf",0), 0.9)
+            if vision.get("severity") == "unknown":
+                vision["severity"] = "severe"; vision["severity_conf"] = max(vision.get("severity_conf",0), 0.85)
 
         # Auto-fill if confident
         if not s.get("issue_type") and vision["type"] != "unknown" and vision["type_conf"] >= 0.75:
@@ -381,27 +388,23 @@ async def chat(
 
         loc_msg = "GPS found" if (s.get('lat') and s.get('lon')) else "no GPS from the photo"
 
-        # Build proposals for the writer
         props = {}
         if vision["type"] != "unknown": props["issue_type"] = vision["type"]
         if vision["severity"] != "unknown": props["severity"] = vision["severity"]
-        if vision["blocked"] != "unknown":
-            props["lane_blocked"] = 1 if vision["blocked"] in ["yes","partial"] else 0
+        if vision["blocked"] != "unknown": props["lane_blocked"] = 1 if vision["blocked"] in ["yes","partial"] else 0
 
-        # Decide what to ask next
-        missing = next_missing_fields(s)
         if not s.get("issue_type"):
             s["step"] = "ask_issue_type"
             reply = natural_reply(s, proposals=props, asks=[issue_prompt()], context_note=f"Photo received; {loc_msg}.")
-            return JSONResponse({"reply": reply, "done": False})
+            return send_json(s, reply, False)
 
         s["step"] = "confirm_issue"
         follow = []
         if not s.get("severity"): follow.append("the severity (minor, moderate, or severe)")
         if s.get("lane_blocked") is None: follow.append("whether a lane is blocked (yes or no)")
         note = "Please confirm the issue type I suggested, or tell me the correct one. " + f"({loc_msg})"
-        reply = natural_reply(s, proposals={"issue_type": s.get("ai_guess"), **({} if not props else props)}, asks=follow[:1], context_note=note)
-        return JSONResponse({"reply": reply, "done": False})
+        reply = natural_reply(s, proposals={"issue_type": s.get("ai_guess"), **props}, asks=follow[:1], context_note=note)
+        return send_json(s, reply, False)
 
     # ---- TEXT path ----
     if text: extract_all_from_text(s, text)
@@ -415,23 +418,23 @@ async def chat(
             elif t in ["no","n","incorrect","wrong"]:
                 s["step"] = "ask_issue_type"
                 reply = natural_reply(s, asks=[issue_prompt()], context_note="Thanks for the correction.")
-                return JSONResponse({"reply": reply, "done": False})
+                return send_json(s, reply, False)
             else:
                 if not s.get("issue_type") or s["issue_type"] == "unknown":
                     s["step"] = "ask_issue_type"
                     reply = natural_reply(s, asks=[issue_prompt()], context_note="I didn’t quite catch the type.")
-                    return JSONResponse({"reply": reply, "done": False})
+                    return send_json(s, reply, False)
         s["step"] = "ask_details"
 
     # Ask for type explicitly
     if s["step"] == "ask_issue_type":
         if not text:
             reply = natural_reply(s, asks=[issue_prompt()], context_note="")
-            return JSONResponse({"reply": reply, "done": False})
+            return send_json(s, reply, False)
         s["issue_type"] = normalize_issue(text)
         if s["issue_type"] == "unknown":
             reply = natural_reply(s, asks=[issue_prompt()], context_note="Sorry, I still didn’t catch that.")
-            return JSONResponse({"reply": reply, "done": False})
+            return send_json(s, reply, False)
         s["step"] = "ask_details"
 
     # Start
@@ -440,7 +443,7 @@ async def chat(
             s["step"] = "ask_details"
         else:
             reply = natural_reply(s, asks=["a short description and the road + nearest milepost or intersection"], context_note="Ready when you are.")
-            return JSONResponse({"reply": reply, "done": False})
+            return send_json(s, reply, False)
 
     # Ask details / Save when complete
     if s["step"] in ["ask_details","ask_location","ask_severity"]:
@@ -465,7 +468,7 @@ async def chat(
                 f"Severity: {s.get('severity') or '(unspecified)'}\n"
                 f"Lane blocked: {'yes' if s.get('lane_blocked') else 'no' if s.get('lane_blocked') == 0 else '(unspecified)'}"
             )
-            return JSONResponse({"reply": out, "done": True})
+            return send_json(s, out, True)
 
         asks = []
         if "issue_type" in missing: asks.append(issue_prompt())
@@ -473,12 +476,12 @@ async def chat(
         if "severity" in missing: asks.append("the severity (minor, moderate, or severe)")
         if "lane_blocked" in missing: asks.append("whether a lane is blocked (yes or no)")
         reply = natural_reply(s, asks=[asks[0]], context_note="")
-        return JSONResponse({"reply":"%s" % reply, "done": False})
+        return send_json(s, reply, False)
 
     if s["step"] == "done":
-        return JSONResponse({"reply":"Report already completed for this session. Send another photo or describe a new issue to start a fresh report.", "done": True})
+        return send_json(s, "Report already completed for this session. Send another photo or describe a new issue to start a fresh report.", True)
 
-    return JSONResponse({"reply":"I didn’t catch that. Try attaching a photo or answering the last question.", "done": False})
+    return send_json(s, "I didn’t catch that. Try attaching a photo or answering the last question.", False)
 
 @app.get("/export.csv")
 def export_csv():
